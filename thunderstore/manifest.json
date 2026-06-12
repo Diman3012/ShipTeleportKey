@@ -1,0 +1,9 @@
+{
+    "name": "ShipTeleportKey",
+    "version_number": "1.5.3",
+    "website_url": "https://github.com/Diman3012/ShipTeleportKey",
+    "description": "Press F4 to teleport yourself to the ship using the ship teleporter. Keeps your held items on teleport, 10s inverse teleporter cooldown. No teleporter on the ship - no teleport. Configurable key.",
+    "dependencies": [
+        "BepInEx-BepInExPack-5.4.2100"
+    ]
+}

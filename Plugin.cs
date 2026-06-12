@@ -17,7 +17,7 @@ namespace ShipTeleportKey
     {
         public const string Guid = "dp991.ShipTeleportKey";
         public const string Name = "ShipTeleportKey";
-        public const string Version = "1.6.0";
+        public const string Version = "1.5.4";
 
         internal static ManualLogSource Log;
         internal static ConfigEntry<Key> TeleportKey;
@@ -46,6 +46,7 @@ namespace ShipTeleportKey
             var harmony = new Harmony(Guid);
             harmony.PatchAll(typeof(KeepItemsPatches));
             harmony.PatchAll(typeof(CooldownPatches));
+            harmony.PatchAll(typeof(TeleportTargetPatches));
             harmony.PatchAll(typeof(NetworkPrefabPatch2));
 
             // Логика живёт на отдельном скрытом объекте: Lethal Company при запуске
@@ -177,43 +178,82 @@ namespace ShipTeleportKey
                 return;
             }
 
-            int targetIndex = -1;
-            for (int i = 0; i < mapScreen.radarTargets.Count; i++)
-            {
-                TransformAndName target = mapScreen.radarTargets[i];
-                if (target != null && target.transform == localPlayer.transform)
-                {
-                    targetIndex = i;
-                    break;
-                }
-            }
+            // На корабле — цель с монитора. На луне — только себя.
+            bool onShip = round.inShipPhase && !localPlayer.isInsideFactory;
+            int targetIndex = onShip
+                ? mapScreen.targetTransformIndex
+                : FindPlayerRadarIndex(mapScreen, localPlayer);
 
-            log.LogInfo($"Телепорт найден: {teleporter.name}. Индекс игрока на радаре: {targetIndex} (целей на радаре: {mapScreen.radarTargets.Count}).");
-
-            if (targetIndex < 0)
+            if (targetIndex < 0 || targetIndex >= mapScreen.radarTargets.Count)
             {
-                log.LogWarning("Не нашёл себя в списке целей радара — отмена.");
+                log.LogWarning("Не удалось определить цель на радаре — отмена.");
                 return;
             }
 
-            StartCoroutine(SwitchTargetAndTeleport(mapScreen, targetIndex, teleporter));
+            string targetName = mapScreen.radarTargets[targetIndex]?.name ?? "?";
+            log.LogInfo(onShip
+                ? $"На корабле — цель [{targetIndex}]: {targetName}."
+                : $"На луне — цель (я) [{targetIndex}]: {targetName}.");
+
+            // На луне радар часто смотрит на другого — нужна синхронизация.
+            // На корабле достаточно текущего выбора на мониторе.
+            bool needsRadarSync = !onShip
+                && (mapScreen.targetTransformIndex != targetIndex
+                    || mapScreen.targetedPlayer == null
+                    || mapScreen.targetedPlayer != localPlayer);
+
+            if (needsRadarSync)
+            {
+                StartCoroutine(SyncRadarAndPress(mapScreen, targetIndex, teleporter));
+                return;
+            }
+
+            PressTeleportWithLockedTarget(mapScreen, targetIndex, teleporter);
         }
 
-        private IEnumerator SwitchTargetAndTeleport(ManualCameraRenderer mapScreen, int targetIndex, ShipTeleporter teleporter)
+        private static int FindPlayerRadarIndex(ManualCameraRenderer mapScreen, PlayerControllerB player)
+        {
+            for (int i = 0; i < mapScreen.radarTargets.Count; i++)
+            {
+                TransformAndName target = mapScreen.radarTargets[i];
+                if (target != null && target.transform == player.transform)
+                    return i;
+            }
+
+            return -1;
+        }
+
+        private static void PressTeleportWithLockedTarget(
+            ManualCameraRenderer mapScreen,
+            int targetIndex,
+            ShipTeleporter teleporter)
+        {
+            TeleportTargetPatches.ApplyRadarTarget(mapScreen, targetIndex);
+            TeleportTargetPatches.LockedTargetIndex = targetIndex;
+            try
+            {
+                ShipTeleportKeyPlugin.Log.LogInfo("Нажимаю кнопку телепорта.");
+                teleporter.PressTeleportButtonOnLocalClient();
+            }
+            catch (System.Exception ex)
+            {
+                ShipTeleportKeyPlugin.Log.LogError($"Ошибка при нажатии телепорта: {ex}");
+            }
+            finally
+            {
+                TeleportTargetPatches.LockedTargetIndex = -1;
+            }
+        }
+
+        private IEnumerator SyncRadarAndPress(ManualCameraRenderer mapScreen, int targetIndex, ShipTeleporter teleporter)
         {
             _teleportInProgress = true;
             try
             {
-                // Наводим радар монитора на себя и даём время на синхронизацию по сети
-                if (mapScreen.targetTransformIndex != targetIndex)
-                {
-                    ShipTeleportKeyPlugin.Log.LogInfo($"Переключаю радар с цели {mapScreen.targetTransformIndex} на {targetIndex}...");
-                    mapScreen.SwitchRadarTargetAndSync(targetIndex);
-                    yield return new WaitForSeconds(0.4f);
-                }
-
-                ShipTeleportKeyPlugin.Log.LogInfo("Нажимаю кнопку телепорта.");
-                teleporter.PressTeleportButtonOnLocalClient();
+                ShipTeleportKeyPlugin.Log.LogInfo($"Синхронизирую радар на индекс {targetIndex}...");
+                mapScreen.SwitchRadarTargetAndSync(targetIndex);
+                yield return new WaitForSecondsRealtime(0.35f);
+                PressTeleportWithLockedTarget(mapScreen, targetIndex, teleporter);
             }
             finally
             {
@@ -232,6 +272,43 @@ namespace ShipTeleportKey
             }
 
             return null;
+        }
+    }
+
+    /// <summary>
+    /// Перед beamUpPlayer фиксирует одну цель на всех клиентах по индексу радара.
+    /// Иначе каждый клиент тянет своего mapScreen.targetedPlayer — «телепорт всех».
+    /// </summary>
+    internal static class TeleportTargetPatches
+    {
+        internal static int LockedTargetIndex = -1;
+
+        internal static void ApplyRadarTarget(ManualCameraRenderer mapScreen, int index)
+        {
+            if (mapScreen == null || index < 0 || index >= mapScreen.radarTargets.Count)
+                return;
+
+            TransformAndName entry = mapScreen.radarTargets[index];
+            if (entry?.transform == null)
+                return;
+
+            mapScreen.targetTransformIndex = index;
+            mapScreen.targetedPlayer = entry.transform.GetComponentInParent<PlayerControllerB>();
+        }
+
+        [HarmonyPatch(typeof(ShipTeleporter), nameof(ShipTeleporter.PressTeleportButtonClientRpc))]
+        [HarmonyPrefix]
+        private static void LockTargetBeforeBeamUp(ShipTeleporter __instance)
+        {
+            if (__instance.isInverseTeleporter)
+                return;
+
+            ManualCameraRenderer mapScreen = StartOfRound.Instance?.mapScreen;
+            if (mapScreen == null)
+                return;
+
+            int index = LockedTargetIndex >= 0 ? LockedTargetIndex : mapScreen.targetTransformIndex;
+            ApplyRadarTarget(mapScreen, index);
         }
     }
 
