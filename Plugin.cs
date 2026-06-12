@@ -15,11 +15,12 @@ namespace ShipTeleportKey
     {
         public const string Guid = "dp991.ShipTeleportKey";
         public const string Name = "ShipTeleportKey";
-        public const string Version = "1.4.0";
+        public const string Version = "1.5.0";
 
         internal static ManualLogSource Log;
         internal static ConfigEntry<Key> TeleportKey;
         internal static ConfigEntry<bool> KeepItems;
+        internal static ConfigEntry<float> InverseCooldown;
 
         private void Awake()
         {
@@ -34,8 +35,15 @@ namespace ShipTeleportKey
                 "KeepItemsOnTeleport",
                 true,
                 "Не выбрасывать предметы из рук при телепортации (и обычным, и инверсным телепортом).");
+            InverseCooldown = Config.Bind(
+                "General",
+                "InverseTeleportCooldownSeconds",
+                10f,
+                "Перезарядка инверсного телепорта (который кидает в помещение) в секундах. В игре по умолчанию 210.");
 
-            new Harmony(Guid).PatchAll(typeof(KeepItemsPatches));
+            var harmony = new Harmony(Guid);
+            harmony.PatchAll(typeof(KeepItemsPatches));
+            harmony.PatchAll(typeof(CooldownPatches));
 
             // Логика живёт на отдельном скрытом объекте: Lethal Company при запуске
             // отключает посторонние GameObject'ы в сцене, включая объект BepInEx.
@@ -284,6 +292,32 @@ namespace ShipTeleportKey
             }
 
             return true;
+        }
+    }
+
+    /// <summary>
+    /// Уменьшает перезарядку инверсного телепорта (по умолчанию в игре — 210 секунд).
+    /// </summary>
+    internal static class CooldownPatches
+    {
+        private static readonly FieldInfo CooldownTimeField =
+            typeof(ShipTeleporter).GetField("cooldownTime", BindingFlags.NonPublic | BindingFlags.Instance);
+
+        [HarmonyPatch(typeof(ShipTeleporter), "Awake")]
+        [HarmonyPostfix]
+        private static void ReduceInverseCooldown(ShipTeleporter __instance)
+        {
+            if (!__instance.isInverseTeleporter)
+                return;
+
+            float newCooldown = Mathf.Max(0f, ShipTeleportKeyPlugin.InverseCooldown.Value);
+            __instance.cooldownAmount = newCooldown;
+
+            // Если телепорт заспавнился уже «на перезарядке», укорачиваем и текущий отсчёт
+            if (CooldownTimeField != null && (float)CooldownTimeField.GetValue(__instance) > newCooldown)
+                CooldownTimeField.SetValue(__instance, newCooldown);
+
+            ShipTeleportKeyPlugin.Log.LogInfo($"Перезарядка инверсного телепорта установлена: {newCooldown} сек.");
         }
     }
 }
