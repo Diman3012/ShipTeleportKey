@@ -1,10 +1,12 @@
 using System.Collections;
+using System.Linq;
 using System.Reflection;
 using BepInEx;
 using BepInEx.Configuration;
 using BepInEx.Logging;
 using GameNetcodeStuff;
 using HarmonyLib;
+using Unity.Netcode;
 using UnityEngine;
 using UnityEngine.InputSystem;
 
@@ -15,7 +17,7 @@ namespace ShipTeleportKey
     {
         public const string Guid = "dp991.ShipTeleportKey";
         public const string Name = "ShipTeleportKey";
-        public const string Version = "1.5.0";
+        public const string Version = "1.6.0";
 
         internal static ManualLogSource Log;
         internal static ConfigEntry<Key> TeleportKey;
@@ -44,6 +46,7 @@ namespace ShipTeleportKey
             var harmony = new Harmony(Guid);
             harmony.PatchAll(typeof(KeepItemsPatches));
             harmony.PatchAll(typeof(CooldownPatches));
+            harmony.PatchAll(typeof(NetworkPrefabPatch2));
 
             // Логика живёт на отдельном скрытом объекте: Lethal Company при запуске
             // отключает посторонние GameObject'ы в сцене, включая объект BepInEx.
@@ -318,6 +321,35 @@ namespace ShipTeleportKey
                 CooldownTimeField.SetValue(__instance, newCooldown);
 
             ShipTeleportKeyPlugin.Log.LogInfo($"Перезарядка инверсного телепорта установлена: {newCooldown} сек.");
+        }
+    }
+
+    /// <summary>
+    /// Регистрирует сетевой префаб мода при инициализации NetworkManager.
+    /// </summary>
+    [HarmonyPatch(typeof(NetworkManager))]
+    internal static class NetworkPrefabPatch2
+    {
+        private static readonly string MOD_GUID = ShipTeleportKeyPlugin.Guid;
+
+        [HarmonyPostfix]
+        [HarmonyPatch(nameof(NetworkManager.SetSingleton))]
+        private static void RegisterPrefab()
+        {
+            var prefab = new GameObject(MOD_GUID + " Prefab");
+            prefab.hideFlags |= HideFlags.HideAndDontSave;
+            Object.DontDestroyOnLoad(prefab);
+            var networkObject = prefab.AddComponent<NetworkObject>();
+            var fieldInfo = typeof(NetworkObject).GetField("GlobalObjectIdHash", BindingFlags.Instance | BindingFlags.NonPublic);
+            fieldInfo!.SetValue(networkObject, GetHash(MOD_GUID));
+
+            NetworkManager.Singleton.PrefabHandler.AddNetworkPrefab(prefab);
+            return;
+
+            static uint GetHash(string value)
+            {
+                return value?.Aggregate(17u, (current, c) => unchecked((current * 31) ^ c)) ?? 0u;
+            }
         }
     }
 }
